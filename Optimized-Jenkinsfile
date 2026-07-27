@@ -1,0 +1,629 @@
+def greenReleaseModules() {
+    return ['core', 'api']
+}
+
+// Generates mock carbon intensity history with proper ISO timestamps.
+// Uses manual string building to stay within the Jenkins script sandbox
+// (groovy.json.JsonOutput is not whitelisted by default).
+def buildMockCarbonData() {
+    def now = new Date()
+    // Build 25 hourly readings (oldest → newest), gently rising 310 → 320 gCO₂/kWh
+    def entries = (0..24).collect { h ->
+        def ts = new Date(now.time - (24 - h) * 3600000L)
+        def isoTs = ts.format("yyyy-MM-dd'T'HH:mm:ss")
+        def intensity = String.format("%.1f", 310.0 + h * 0.4)
+        "{\"timestamp\":\"${isoTs}\",\"intensity\":${intensity}}"
+    }
+    return [
+        history:  '[' + entries.join(',') + ']',
+        forecast: '[{"hour":1,"intensity":300.0},{"hour":2,"intensity":250.0},{"hour":3,"intensity":180.0}]'
+    ]
+}
+
+// Serializes carbon history returned by the optimizer (list of {timestamp,intensity} maps)
+// without using groovy.json.JsonOutput (not sandbox-whitelisted).
+def serializeCarbonHistory(histList) {
+    def entries = histList.collect { h ->
+        "{\"timestamp\":\"${h.timestamp}\",\"intensity\":${h.intensity}}"
+    }
+    return '[' + entries.join(',') + ']'
+}
+
+// Serializes carbon forecast returned by the optimizer (list of {hour,intensity} maps).
+def serializeCarbonForecast(forecastList) {
+    def entries = forecastList.collect { f ->
+        "{\"hour\":${f.hour},\"intensity\":${f.intensity}}"
+    }
+    return '[' + entries.join(',') + ']'
+}
+
+def discoverModuleTestInventory() {
+    def inventory = [:]
+    greenReleaseModules().each { moduleName ->
+        def countText = sh(
+            script: '''
+                module="''' + moduleName + '''"
+                if [ -d "$module/src/test/java" ]; then
+                  grep -Rho '@Test' "$module/src/test/java" --include='*.java' 2>/dev/null | wc -l | tr -d ' '
+                else
+                  echo 0
+                fi
+            ''',
+            returnStdout: true
+        ).trim()
+        inventory[moduleName] = countText ? countText.toInteger() : 0
+    }
+    return inventory
+}
+
+def readSurefireTestCounts() {
+    def counts = [:]
+    greenReleaseModules().each { moduleName ->
+        def countText = sh(
+            script: '''
+                module="''' + moduleName + '''"
+                report_dir="$module/target/surefire-reports"
+                if [ -d "$report_dir" ] && find "$report_dir" -name 'TEST-*.xml' -type f | grep -q .; then
+                  find "$report_dir" -name 'TEST-*.xml' -type f -exec awk 'BEGIN { total = 0 } /<testsuite / { if (match($0, /tests="[0-9]+"/)) { value = substr($0, RSTART + 7, RLENGTH - 8); total += value } } END { print total }' {} +
+                else
+                  echo 0
+                fi
+            ''',
+            returnStdout: true
+        ).trim()
+        counts[moduleName] = countText ? countText.toInteger() : 0
+    }
+    return counts
+}
+
+def affectedModuleSet() {
+    if (env.AFFECTED_MODULES == 'all') {
+        return greenReleaseModules() as Set
+    }
+    if (!env.AFFECTED_MODULES?.trim()) {
+        return [] as Set
+    }
+    return env.AFFECTED_MODULES.split(',').collect { it.trim() }.findAll { it } as Set
+}
+
+pipeline {
+    agent any
+    
+    parameters {
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: false,
+            description: 'When true, only run the optimizer analysis without building, testing, or deploying.'
+        )
+        booleanParam(
+            name: 'FORCE_FULL_BUILD',
+            defaultValue: false,
+            description: 'Skip the optimizer analysis and force a full build and test of all modules.'
+        )
+        booleanParam(
+            name: 'ENABLE_GREEN_SCHEDULING',
+            defaultValue: true,
+            description: 'Allow the pipeline to delay the build until a greener time window.'
+        )
+        string(
+            name: 'OVERRIDE_SCHEDULE_HOUR',
+            defaultValue: 'auto',
+            description: 'Override ML recommendation (e.g., "5" for 5 AM). Use "auto" to let the ML model decide.'
+        )
+    }
+
+    environment {
+        DOCKER_IMAGE   = 'beliver247/green-test-backend'
+        DOCKER_TAG     = "${BUILD_NUMBER}"
+        DASHBOARD_URL  = 'http://host.docker.internal:5003'
+        ELECTRICITY_MAPS_API_KEY = 'em_nGgVAPUefFX2qe8BkqzFgw3n8uGpJE2J'
+    }
+
+    stages {
+        stage('Notify Start') {
+            steps {
+                script {
+                    env.PIPELINE_START = System.currentTimeMillis().toString()
+                    env.COMMIT_SHA = ''
+                    env.COMMIT_MSG = ''
+                    env.WORK_DIR = fileExists('pom.xml') ? '.' : 'green-release-demo'
+                }
+            }
+        }
+
+        stage('Setup Tools') {
+            steps {
+                script {
+                    def workspace = pwd()
+                    echo "Setting up local tool binaries (Docker CLI, Maven, and Docker Compose)..."
+                    
+                    sh 'mkdir -p tool-bin'
+                    
+                    if (sh(script: 'command -v docker >/dev/null 2>&1', returnStatus: true) != 0) {
+                        if (!fileExists('tool-bin/docker')) {
+                            echo "Docker CLI not found. Downloading static binary..."
+                            sh '''
+                                curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.3.1.tgz -o docker.tgz
+                                tar -xzf docker.tgz --strip-components=1 -C tool-bin docker/docker
+                                rm -f docker.tgz
+                                chmod +x tool-bin/docker
+                            '''
+                        }
+                    } else {
+                        echo "System docker command is already available."
+                    }
+                    
+                    if (sh(script: 'command -v docker-compose >/dev/null 2>&1', returnStatus: true) != 0) {
+                        if (!fileExists('tool-bin/docker-compose')) {
+                            echo "Docker Compose not found. Downloading static binary..."
+                            sh '''
+                                curl -fsSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 -o tool-bin/docker-compose
+                                chmod +x tool-bin/docker-compose
+                            '''
+                        }
+                    } else {
+                        echo "System docker-compose command is already available."
+                    }
+                    
+                    if (sh(script: 'command -v mvn >/dev/null 2>&1', returnStatus: true) != 0) {
+                        if (!fileExists('tool-bin/maven/bin/mvn')) {
+                            echo "Maven not found. Downloading Apache Maven..."
+                            sh '''
+                                curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.9.6/binaries/apache-maven-3.9.6-bin.tar.gz -o maven.tar.gz
+                                mkdir -p tool-bin/maven
+                                tar -xzf maven.tar.gz -C tool-bin/maven --strip-components=1
+                                rm -f maven.tar.gz
+                                chmod +x tool-bin/maven/bin/mvn
+                            '''
+                        }
+                    } else {
+                        echo "System mvn command is already available."
+                    }
+                    
+                    env.PATH = "${workspace}/tool-bin:${workspace}/tool-bin/maven/bin:${env.PATH}"
+                    sh 'docker --version'
+                    sh 'mvn --version'
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                script {
+                    if (!fileExists('pom.xml')) {
+                        echo "Checking out green-release-demo..."
+                        dir(env.WORK_DIR) {
+                            checkout([$class: 'GitSCM',
+                                branches: [[name: '*/main']],
+                                userRemoteConfigs: [[
+                                    url: 'https://github.com/Beliver-247/green-test-backend.git'
+                                ]],
+                                extensions: [[ $class: 'CloneOption', shallow: false, depth: 0, noTags: false ]]
+                            ])
+                        }
+                    } else {
+                        echo "Found pom.xml in workspace root. Using existing root checkout."
+                        sh "git status || echo 'Not a git repo'"
+                        sh "git rev-parse HEAD || echo 'No git commit'"
+                        echo "Forcing checkout of latest main..."
+                        sh """
+                            git fetch origin main || true
+                            git checkout -B main origin/main || true
+                            git pull origin main || true
+                        """
+                    }
+                    dir(env.WORK_DIR) {
+                        env.COMMIT_SHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+                        env.COMMIT_MSG = sh(script: 'git log -1 --pretty=%s', returnStdout: true).trim()
+                        
+                        if (fileExists('.last_built_commit')) {
+                            env.GIT_PREVIOUS_SUCCESSFUL_COMMIT = readFile('.last_built_commit').trim()
+                        } else {
+                            env.GIT_PREVIOUS_SUCCESSFUL_COMMIT = 'null'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Optimizer - Analyze') {
+            steps {
+                dir(env.WORK_DIR) {
+                    script {
+                        if (params.FORCE_FULL_BUILD) {
+                            echo "=== FORCE_FULL_BUILD is enabled. Skipping Optimizer analysis ==="
+                            env.OPTIMIZER_STATUS = 'success'
+                            env.AFFECTED_MODULES = 'all'
+                            env.MAVEN_BUILD_COMMANDS = 'mvn clean install -DskipTests'
+                            env.MAVEN_TEST_COMMANDS = 'mvn test'
+                            env.OPTIMIZER_DURATION = '0'
+                            // Inject mock carbon data (proper timestamp format for dashboard)
+                            def mockCarbon = buildMockCarbonData()
+                            env.CARBON_INTENSITY    = '320.0'
+                            env.GREEN_PROBABILITY   = '0.35'
+                            env.SCHEDULING_ACTION   = 'execute_now'
+                            env.SCHEDULING_ENGINE   = 'mock'
+                            env.SCHEDULED_HOUR      = ''
+                            env.TARGET_INTENSITY    = ''
+                            env.CARBON_HISTORY      = mockCarbon.history
+                            env.CARBON_FORECAST     = mockCarbon.forecast
+                            return
+                        }
+
+                        def analyzeStart = System.currentTimeMillis()
+                        def output = sh(
+                            script: '''
+                                EXIT_CODE=0
+                                tar -C "$PWD" -cf - . | docker run --rm -i \
+                                  -e ELECTRICITY_MAPS_API_KEY="''' + (env.ELECTRICITY_MAPS_API_KEY ?: '') + '''" \
+                                  -e GIT_PREVIOUS_SUCCESSFUL_COMMIT="''' + env.GIT_PREVIOUS_SUCCESSFUL_COMMIT + '''" \
+                                  -e GIT_PREVIOUS_COMMIT="''' + env.GIT_PREVIOUS_COMMIT + '''" \
+                                  -e GIT_COMMIT="''' + env.GIT_COMMIT + '''" \
+                                  -v /var/run/docker.sock:/var/run/docker.sock \
+                                  beliver247/build-optimizer-agent:latest \
+                                  bash -lc '
+                                    set -e
+                                    mkdir -p /work
+                                    tar -xf - -C /work
+                                    cd /work
+                                    git config --global --add safe.directory /work
+
+                                    python3 -m optimizer \
+                                      --project-root /work \
+                                      --dry-run true \
+                                      --output-format json \
+                                      --carbon-aware
+                                  ' || EXIT_CODE=$?
+
+                                if [ "$EXIT_CODE" -eq 1 ]; then
+                                  echo "OPTIMIZER_ERROR"
+                                  exit 1
+                                fi
+                            ''',
+                            returnStdout: true
+                        ).trim()
+
+                        env.OPTIMIZER_DURATION = ((System.currentTimeMillis() - analyzeStart) / 1000.0).toString()
+
+                        echo "=== Build Optimizer Output ==="
+                        echo output
+                        echo "=============================="
+
+                        def jsonLine = output.readLines().find { it.startsWith('{"') }
+                        if (jsonLine) {
+                            def result = new groovy.json.JsonSlurper().parseText(jsonLine)
+                            env.OPTIMIZER_STATUS = result.status ?: 'unknown'
+
+                            def buildCommands = []
+                            def testCommands = []
+                            for (action in result.actions) {
+                                if (action.name == 'build') {
+                                    buildCommands.add(action.command.join(' '))
+                                } else if (action.name == 'test') {
+                                    testCommands.add(action.command.join(' '))
+                                }
+                            }
+                            env.MAVEN_BUILD_COMMANDS = buildCommands.join('|||')
+                            env.MAVEN_TEST_COMMANDS = testCommands.join('|||')
+
+                            def affectedModules = result.affected_modules ?: []
+                            env.AFFECTED_MODULES = affectedModules.join(',')
+
+                            echo "Optimizer status: ${env.OPTIMIZER_STATUS}"
+                            echo "Affected modules: ${env.AFFECTED_MODULES}"
+                            echo "Build commands: ${env.MAVEN_BUILD_COMMANDS}"
+                            echo "Test commands: ${env.MAVEN_TEST_COMMANDS}"
+
+                            if (result.scheduling) {
+                                env.CARBON_INTENSITY = result.scheduling.current_intensity?.toString() ?: ''
+                                env.GREEN_PROBABILITY = result.scheduling.green_probability?.toString() ?: ''
+                                env.SCHEDULING_ACTION = result.scheduling.action ?: ''
+                                env.SCHEDULING_ENGINE = result.scheduling.engine ?: ''
+                                env.SCHEDULED_HOUR = result.scheduling.scheduled_hour?.toString() ?: ''
+                                env.TARGET_INTENSITY = result.scheduling.target_intensity?.toString() ?: ''
+                                // Use optimizer history/forecast if available;
+                                // fall back to mock when Docker image is outdated (pre-serialized-history)
+                                if (result.scheduling.carbon_history) {
+                                    env.CARBON_HISTORY = serializeCarbonHistory(result.scheduling.carbon_history)
+                                } else {
+                                    echo "[GreenOptimizer] carbon_history missing from optimizer output. Using mock history."
+                                    env.CARBON_HISTORY = buildMockCarbonData().history
+                                }
+                                if (result.scheduling.carbon_forecast) {
+                                    env.CARBON_FORECAST = serializeCarbonForecast(result.scheduling.carbon_forecast)
+                                } else {
+                                    env.CARBON_FORECAST = buildMockCarbonData().forecast
+                                }
+                            } else {
+                                // Optimizer ran but returned no scheduling block — use mock carbon data
+                                echo "[GreenOptimizer] No scheduling data in optimizer output. Using mock carbon data."
+                                def mockCarbon = buildMockCarbonData()
+                                env.CARBON_INTENSITY    = '320.0'
+                                env.GREEN_PROBABILITY   = '0.35'
+                                env.SCHEDULING_ACTION   = 'execute_now'
+                                env.SCHEDULING_ENGINE   = 'mock'
+                                env.SCHEDULED_HOUR      = ''
+                                env.TARGET_INTENSITY    = ''
+                                env.CARBON_HISTORY      = mockCarbon.history
+                                env.CARBON_FORECAST     = mockCarbon.forecast
+                            }
+                        } else {
+                            env.OPTIMIZER_STATUS = 'no_changes'
+                            env.MAVEN_BUILD_COMMANDS = ''
+                            env.MAVEN_TEST_COMMANDS = ''
+                            env.AFFECTED_MODULES = ''
+                        }
+                        
+                        if (params.DRY_RUN) {
+                            echo "=== DRY RUN MODE — Skipping build, test, Docker, and deploy stages ==="
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Green Scheduling') {
+            when {
+                expression { params.ENABLE_GREEN_SCHEDULING && env.OPTIMIZER_STATUS == 'success' }
+            }
+            steps {
+                script {
+                    def targetHourStr = params.OVERRIDE_SCHEDULE_HOUR
+                    def shouldSchedule = false
+                    def targetHour = 0
+                    
+                    if (targetHourStr != 'auto') {
+                        targetHour = targetHourStr.toInteger()
+                        echo "🌿 Developer OVERRIDE: Scheduling build for ${targetHour}:00."
+                        shouldSchedule = true
+                    } else if (env.SCHEDULING_ACTION == 'schedule' && env.SCHEDULED_HOUR) {
+                        targetHour = env.SCHEDULED_HOUR.toInteger()
+                        echo "🌿 Carbon intensity is high (${env.CARBON_INTENSITY}). ML Model recommends delaying until ${targetHour}:00."
+                        shouldSchedule = true
+                    } else if (env.SCHEDULING_ACTION == 'execute_now') {
+                        echo "🌿 ML Model says it's a Green Window right now! Proceeding with build."
+                    }
+
+                    if (shouldSchedule) {
+                        def now = new Date()
+                        def currentHour = now.getHours()
+                        def hoursToWait = targetHour - currentHour
+                        if (hoursToWait <= 0) {
+                            hoursToWait += 24
+                        }
+                        
+                        def delayInSeconds = hoursToWait * 3600
+                        
+                        echo "Queueing a new build to start in ${hoursToWait} hours (${delayInSeconds} seconds)..."
+                        
+                        build job: env.JOB_NAME, quietPeriod: delayInSeconds, wait: false, parameters: [
+                            booleanParam(name: 'ENABLE_GREEN_SCHEDULING', value: false),
+                            booleanParam(name: 'DRY_RUN', value: params.DRY_RUN),
+                            booleanParam(name: 'FORCE_FULL_BUILD', value: params.FORCE_FULL_BUILD),
+                            string(name: 'OVERRIDE_SCHEDULE_HOUR', value: 'auto')
+                        ]
+                        
+                        currentBuild.description = "🌿 Rescheduled for ${targetHour}:00"
+                        env.IS_RESCHEDULED = 'true'
+                        currentBuild.result = 'ABORTED'
+                        error("Pipeline rescheduled to a greener window at ${targetHour}:00 to save carbon.")
+                    }
+                }
+            }
+        }
+
+        stage('Selective Build') {
+            when {
+                expression { !params.DRY_RUN && env.OPTIMIZER_STATUS == 'success' && env.MAVEN_BUILD_COMMANDS?.trim() }
+            }
+            steps {
+                dir(env.WORK_DIR) {
+                    script {
+                        def buildStart = System.currentTimeMillis()
+                        echo "Running selective Maven build for modules: ${env.AFFECTED_MODULES}"
+                        env.MAVEN_BUILD_COMMANDS.split('\\|\\|\\|').each { cmd ->
+                            echo "Executing: ${cmd}"
+                            sh cmd
+                        }
+                        env.BUILD_DURATION = ((System.currentTimeMillis() - buildStart) / 1000.0).toString()
+                    }
+                }
+            }
+        }
+
+        stage('Selective Test') {
+            when {
+                expression { !params.DRY_RUN && env.OPTIMIZER_STATUS == 'success' && env.MAVEN_TEST_COMMANDS?.trim() }
+            }
+            steps {
+                dir(env.WORK_DIR) {
+                    script {
+                        def testStart = System.currentTimeMillis()
+                        echo "Running selective tests for modules: ${env.AFFECTED_MODULES}"
+
+                        def testOutput = ''
+                        env.MAVEN_TEST_COMMANDS.split('\\|\\|\\|').each { cmd ->
+                            echo "Executing: ${cmd}"
+                            testOutput += sh(script: cmd, returnStdout: true)
+                        }
+                        env.TEST_DURATION = ((System.currentTimeMillis() - testStart) / 1000.0).toString()
+
+                        def testsRun = 0
+                        def testsSkipped = 0
+                        def moduleDetails = [:]
+
+                        def inventory = discoverModuleTestInventory()
+                        def executed = readSurefireTestCounts()
+                        def affected = affectedModuleSet()
+
+                        greenReleaseModules().each { mod ->
+                            def moduleTotal = inventory[mod] ?: 0
+                            def moduleRun = affected.contains(mod) ? (executed[mod] ?: 0) : 0
+                            def moduleSkipped = affected.contains(mod) ? 0 : moduleTotal
+                            def status = affected.contains(mod) ? 'run' : 'skipped'
+
+                            moduleDetails[mod] = ['status': status, 'run': moduleRun, 'skipped': moduleSkipped]
+                            testsRun += moduleRun
+                            testsSkipped += moduleSkipped
+                        }
+                        
+                        env.TESTS_EXECUTED = testsRun.toString()
+                        env.TESTS_SKIPPED = testsSkipped.toString()
+                        env.MODULE_DETAILS = groovy.json.JsonOutput.toJson(moduleDetails).replaceAll('"', '\\\\"')
+                        
+                        echo "Total tests executed: ${env.TESTS_EXECUTED}"
+                        echo "Total tests skipped: ${env.TESTS_SKIPPED}"
+                        echo "Module Details: ${env.MODULE_DETAILS}"
+                    }
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            when {
+                expression { !params.DRY_RUN && (env.AFFECTED_MODULES == 'all' || env.AFFECTED_MODULES?.split(',')?.contains('app')) }
+            }
+            steps {
+                dir(env.WORK_DIR) {
+                    script {
+                        def dockerStart = System.currentTimeMillis()
+                        dir('api') {
+                            echo "Building Docker image: ${DOCKER_IMAGE}:${DOCKER_TAG}"
+                            sh "docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} -t ${DOCKER_IMAGE}:latest ."
+                        }
+                        env.DOCKER_BUILD_DURATION = ((System.currentTimeMillis() - dockerStart) / 1000.0).toString()
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Locally') {
+            when {
+                expression { !params.DRY_RUN && (env.AFFECTED_MODULES == 'all' || env.AFFECTED_MODULES?.split(',')?.contains('app')) }
+            }
+            steps {
+                dir(env.WORK_DIR) {
+                    script {
+                        def deployStart = System.currentTimeMillis()
+                        echo "Deploying app locally on port 8087..."
+                        sh """
+                            export HOST_PORT=8087
+                            docker-compose -p green-opt down || true
+                            # Kill any stale container holding port 8087
+                            docker ps -q --filter "publish=8087" | xargs docker rm -f || true
+                            docker-compose -p green-opt up -d
+                            sleep 15
+                            docker-compose -p green-opt ps
+                        """
+                        env.DEPLOY_DURATION = ((System.currentTimeMillis() - deployStart) / 1000.0).toString()
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Test (Local)') {
+            when {
+                expression { !params.DRY_RUN && (env.AFFECTED_MODULES == 'all' || env.AFFECTED_MODULES?.split(',')?.contains('app')) }
+            }
+            steps {
+                dir(env.WORK_DIR) {
+                    sh '''
+                        echo "Checking health endpoint..."
+                        for i in 1 2 3 4 5 6 7 8 9 10; do
+                            echo "Attempt $i..."
+                            if curl -s -f http://localhost:8087/health; then
+                                echo "\\nSMOKE_TEST_PASSED"
+                                exit 0
+                            fi
+                            if curl -s -f http://host.docker.internal:8087/health; then
+                                echo "\\nSMOKE_TEST_PASSED"
+                                exit 0
+                            fi
+                            if curl -s -f http://172.17.0.1:8087/health; then
+                                echo "\\nSMOKE_TEST_PASSED"
+                                exit 0
+                            fi
+                            sleep 5
+                        done
+                        echo "Smoke test failed!"
+                        exit 1
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            dir(env.WORK_DIR) {
+                script {
+                    def totalDuration = (System.currentTimeMillis() - env.PIPELINE_START.toLong()) / 1000.0
+
+                    def currentStatus = currentBuild.currentResult ?: 'UNKNOWN'
+                    if (env.IS_RESCHEDULED == 'true') {
+                        currentStatus = 'RESCHEDULED'
+                    }
+
+                    def cleanCommitMsg = (env.COMMIT_MSG ?: '').replaceAll('"', '\\\\"')
+                    def jsonPayload = """{
+                        "job_name": "${env.JOB_NAME}",
+                        "build_number": "${env.BUILD_NUMBER}",
+                        "pipeline_type": "optimized",
+                        "commit_sha": "${env.COMMIT_SHA ?: ''}",
+                        "commit_message": "${cleanCommitMsg}",
+                        "status": "${currentStatus}",
+                        "total_duration_s": ${totalDuration},
+                        "build_duration_s": ${env.BUILD_DURATION ?: 'null'},
+                        "test_duration_s": ${env.TEST_DURATION ?: 'null'},
+                        "docker_duration_s": ${env.DOCKER_BUILD_DURATION ?: 'null'},
+                        "deploy_duration_s": ${env.DEPLOY_DURATION ?: 'null'},
+                        "optimizer_duration_s": ${env.OPTIMIZER_DURATION ?: 'null'},
+                        "modules_built": "${env.AFFECTED_MODULES ?: ''}",
+                        "modules_tested": "${env.AFFECTED_MODULES ?: ''}",
+                        "tests_executed": ${env.TESTS_EXECUTED ?: 0},
+                        "tests_skipped": ${env.TESTS_SKIPPED ?: 0},
+                        "module_details": "${env.MODULE_DETAILS ?: ''}",
+                        "build_command": "${(env.MAVEN_BUILD_COMMANDS ?: '').replaceAll('"', '\\\\"')}",
+                        "test_command": "${(env.MAVEN_TEST_COMMANDS ?: '').replaceAll('"', '\\\\"')}",
+                        "carbon_intensity": ${env.CARBON_INTENSITY ?: 'null'},
+                        "green_probability": ${env.GREEN_PROBABILITY ?: 'null'},
+                        "scheduling_action": "${env.SCHEDULING_ACTION ?: ''}",
+                        "scheduling_engine": "${env.SCHEDULING_ENGINE ?: ''}",
+                        "carbon_history": ${env.CARBON_HISTORY ?: '[]'},
+                        "carbon_forecast": ${env.CARBON_FORECAST ?: '[]'}
+                    }"""
+
+                    writeFile file: 'dashboard_payload.json', text: jsonPayload
+                    
+                    sh """
+                        curl -s -X POST ${DASHBOARD_URL}/api/builds \
+                            -H "Content-Type: application/json" \
+                            -d @dashboard_payload.json || \
+                        curl -s -X POST http://localhost:5003/api/builds \
+                            -H "Content-Type: application/json" \
+                            -d @dashboard_payload.json || \
+                        curl -s -X POST http://127.0.0.1:5003/api/builds \
+                            -H "Content-Type: application/json" \
+                            -d @dashboard_payload.json || \
+                        curl -s -X POST http://172.17.0.1:5003/api/builds \
+                            -H "Content-Type: application/json" \
+                            -d @dashboard_payload.json || \
+                        echo "Failed to send metrics to dashboard."
+                    """
+                }
+                
+                sh "docker rmi ${DOCKER_IMAGE}:${DOCKER_TAG} || true"
+                sh "docker image prune -f || true"
+            }
+        }
+        success {
+            echo "Deployment SUCCESSFUL — Build #${BUILD_NUMBER}"
+            dir(env.WORK_DIR) {
+                sh "echo ${env.COMMIT_SHA} > .last_built_commit"
+            }
+        }
+        failure {
+            echo "Deployment FAILED — Build #${BUILD_NUMBER}"
+        }
+    }
+}
