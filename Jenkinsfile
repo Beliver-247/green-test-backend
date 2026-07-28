@@ -29,6 +29,7 @@ pipeline {
         DOCKER_TAG   = "${BUILD_NUMBER}"
         REPO_URL     = 'https://github.com/Beliver-247/green-test-backend.git'
         HOST_PORT    = '8087'
+        ELECTRICITY_MAPS_API_KEY = 'em_nGgVAPUefFX2qe8BkqzFgw3n8uGpJE2J'
     }
 
     stages {
@@ -46,11 +47,31 @@ pipeline {
                         env.BUILD_CMDS = 'mvn clean install -DskipTests'
                         env.TEST_CMDS  = 'mvn test'
                     } else {
-                        def out = sh(script: "tar -cf - . | docker run --rm -i beliver247/build-optimizer-agent:latest bash -lc 'mkdir -p /w && tar -xf - -C /w && cd /w && git config --global --add safe.directory /w && export GIT_PREVIOUS_SUCCESSFUL_COMMIT=\$(cat .last_built_commit 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo HEAD) GIT_COMMIT=\$(git rev-parse HEAD) && python3 -m optimizer --project-root . --dry-run true --output-format json'", returnStdout: true)
+                        def out = sh(script: "tar -cf - . | docker run --rm -i -e ELECTRICITY_MAPS_API_KEY=\"\${env.ELECTRICITY_MAPS_API_KEY}\" beliver247/build-optimizer-agent:latest bash -lc 'mkdir -p /w && tar -xf - -C /w && cd /w && git config --global --add safe.directory /w && export GIT_PREVIOUS_SUCCESSFUL_COMMIT=\$(cat .last_built_commit 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo HEAD) GIT_COMMIT=\$(git rev-parse HEAD) && python3 -m optimizer --project-root . --dry-run true --output-format json --carbon-aware'", returnStdout: true)
                         def j = new groovy.json.JsonSlurper().parseText(out.substring(out.indexOf('{')))
                         env.OPTIMIZER_STATUS = j.status
                         env.BUILD_CMDS = j.actions?.findAll{it.name=='build'}?.collect{it.command.join(' ')}?.join(' && ') ?: ''
                         env.TEST_CMDS  = j.actions?.findAll{it.name=='test'}?.collect{it.command.join(' ')}?.join(' && ') ?: ''
+                        env.SCHEDULING_ACTION = j.scheduling?.action ?: 'execute_now'
+                        env.SCHEDULED_HOUR = j.scheduling?.target_hour?.toString() ?: '0'
+                    }
+                }
+            }
+        }
+
+        stage('Green Scheduling') {
+            when { expression { params.ENABLE_GREEN_SCHEDULING && env.OPTIMIZER_STATUS == 'success' } }
+            steps {
+                script {
+                    def target = params.OVERRIDE_SCHEDULE_HOUR != 'auto' ? params.OVERRIDE_SCHEDULE_HOUR.toInteger() : env.SCHEDULED_HOUR.toInteger()
+                    
+                    if (target > 0 && (env.SCHEDULING_ACTION == 'schedule' || params.OVERRIDE_SCHEDULE_HOUR != 'auto')) {
+                        def delaySecs = ((target - new Date().getHours() + 24) % 24) * 3600
+                        build job: env.JOB_NAME, quietPeriod: delaySecs, wait: false, parameters: [
+                            booleanParam(name: 'ENABLE_GREEN_SCHEDULING', value: false),
+                            booleanParam(name: 'FORCE_FULL_BUILD', value: params.FORCE_FULL_BUILD)
+                        ]
+                        error("Pipeline rescheduled to ${target}:00 to save carbon.")
                     }
                 }
             }
