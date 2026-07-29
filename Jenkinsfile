@@ -73,7 +73,10 @@ pipeline {
                             booleanParam(name: 'ENABLE_GREEN_SCHEDULING', value: false),
                             booleanParam(name: 'FORCE_FULL_BUILD', value: params.FORCE_FULL_BUILD)
                         ]
-                        error("Pipeline rescheduled to ${target}:00 to save carbon.")
+                        currentBuild.result = 'ABORTED'
+                        currentBuild.description = "🌿 Rescheduled to ${target}:00"
+                        env.OPTIMIZER_STATUS = 'rescheduled'
+                        return
                     } else {
                         echo "🌿 ML Model says it's a Green Window right now! Proceeding with build."
                     }
@@ -146,6 +149,9 @@ pipeline {
         }
         failure {
             echo "Deployment FAILED — Build #${BUILD_NUMBER}"
+        }
+        aborted {
+            echo "Deployment ABORTED — Pipeline rescheduled to a greener time window."
         }
     }
 }

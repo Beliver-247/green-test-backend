@@ -15,7 +15,6 @@ public class GreetingController {
     
     @GetMapping("/hello")
     public String hello() {
-        System.out.println("greeting service says hello !");
         return greetingService.getGreeting();
     }
 }
