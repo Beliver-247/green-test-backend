@@ -53,7 +53,7 @@ pipeline {
                         env.BUILD_CMDS = j.actions?.findAll{it.name=='build'}?.collect{it.command.join(' ')}?.join(' && ') ?: ''
                         env.TEST_CMDS  = j.actions?.findAll{it.name=='test'}?.collect{it.command.join(' ')}?.join(' && ') ?: ''
                         env.SCHEDULING_ACTION = j.scheduling?.action ?: 'execute_now'
-                        env.SCHEDULED_HOUR = j.scheduling?.target_hour?.toString() ?: '0'
+                        env.SCHEDULED_HOUR = j.scheduling?.scheduled_hour?.toString() ?: '0'
                     }
                 }
             }
@@ -65,7 +65,7 @@ pipeline {
                 script {
                     def target = params.OVERRIDE_SCHEDULE_HOUR != 'auto' ? params.OVERRIDE_SCHEDULE_HOUR.toInteger() : env.SCHEDULED_HOUR.toInteger()
                     
-                    if (target > 0 && (env.SCHEDULING_ACTION == 'schedule' || params.OVERRIDE_SCHEDULE_HOUR != 'auto')) {
+                    if (env.SCHEDULING_ACTION == 'schedule' || params.OVERRIDE_SCHEDULE_HOUR != 'auto') {
                         def delaySecs = ((target - new Date().getHours() + 24) % 24) * 3600
                         echo "🌿 Carbon intensity is high. ML Model recommends delaying until ${target}:00."
                         echo "Queueing a new build to start in ${delaySecs} seconds..."
