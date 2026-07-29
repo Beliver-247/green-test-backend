@@ -35,6 +35,7 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
+                deleteDir()
                 git branch: 'main', url: "${REPO_URL}"
             }
         }
